@@ -1,0 +1,11 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: node-omcache
+Source: https://github.com/bereal/node-omcache
+
+Files: *
+Copyright: 2014 Alexander Berezhnoy <alexander.berezhnoy@gmail.com>
+License: Apache-2.0
+
+License: Apache-2.0
+  On Debian GNU/Linux system you can find the complete text of the
+  Apache 2.0 license in '/usr/share/common-licenses/Apache-2.0'.
