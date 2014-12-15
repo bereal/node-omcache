@@ -7,12 +7,8 @@ VERSION := 0.0.1
 
 NODEJS_PACKAGE ?= nodejs
 
-ifeq ($(wildcard /etc/debian_version),"")
-NODEJS_VERSION ?= $(shell dpkg-query -f '$${Version}\n' -W $(NODEJS_PACKAGE) | cut -d- -f1)
+NODEJS_VERSION ?= $(shell node --version)
 NODEGYP_TARGET := --target=$(NODEJS_VERSION)
-else
-NODEGYP_TARGET :=
-endif
 
 export DEB_DH_GENCONTROL_ARGS_ALL = -- -Vmisc:Depends=$(NODEJS_PACKAGE)
 export DEB_DH_INSTALL_ARGS := $(BASE)/omcache.node
@@ -25,6 +21,11 @@ $(OMCACHE_BIN): build/binding.Makefile
 build/binding.Makefile:
 	node-gyp $(NODEGYP_TARGET) --ensure --verbose install
 	node-gyp $(NODEGYP_TARGET) configure
+
+test: $(OMCACHE_BIN)
+	mkdir -p tests/node_modules
+	cp $< tests/node_modules
+	cd tests && npm install mocha && ./node_modules/.bin/mocha
 
 install: $(OMCACHE_BIN)
 	mkdir -p $(BASE)
