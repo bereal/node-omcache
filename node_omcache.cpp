@@ -19,6 +19,10 @@ const uint8_t CMD_INC=0x05;
 const uint8_t CMD_DEC=0x06;
 
 
+static void Log(void * ctx, int level, const char *msg) {
+    std::cout << msg << std::endl;
+}
+
 /************************************************************
  * Prepare data and populate the request
  ************************************************************/
@@ -144,7 +148,7 @@ bool Callback::Ping() {
     if (m_called) return true;
     omcache_value_t value;
     memset(&value, 0, sizeof(omcache_value_t));
-    size_t value_count=1;
+    size_t value_count = 1;
 
     if (!m_request_count) return true;
 
@@ -156,13 +160,18 @@ bool Callback::Ping() {
     Handle<Value> argv[2] = {Undefined(), Undefined()};
     Handle<Value> data = Undefined();
 
+    bool err = value.status != OMCACHE_OK;
+
     if (value_count && value.data) {
         data = String::New(reinterpret_cast<const char *>(value.data), value.data_len);
+    } else if (err) {
+        const char * strerror = omcache_strerror(value.status);
+        data = String::New(strerror, strlen(strerror));
     }
 
     m_called = true;
 
-    argv[(value.status == OMCACHE_OK) ? 1 : 0] = data;
+    argv[err ? 0 : 1] = data;
     m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
 
     scope.Close(Undefined());
@@ -352,6 +361,7 @@ public:
         m_omc = omcache_init();
         m_poller = new Poller(m_omc);
         omcache_set_servers(m_omc, servers.c_str());
+        //        omcache_set_log_callback(m_omc, 100, Log, NULL);
     }
 
     ~OMCache();
