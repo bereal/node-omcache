@@ -15,16 +15,20 @@ function test_string(prefix) {
 describe('OMCache', function() {
     var omc = connect();
 
-    describe('#set() #get()', function() {
+    function assertKeyValue(key, value, done) {
+        omc.get(key, function(err, data) {
+            assert.equal(data, value);
+            return done(err);
+        })
+    }
+
+    describe('#set()', function() {
         it('should set the value successfully', function(done) {
             var key = test_string('key');
             var value = test_string('value');
             omc.set(key, value, 123, function(err, data) {
                 if (err) done(err);
-                omc.get(key, function(err, data) {
-                    assert.strictEqual(data, value);
-                    return done(err);
-                });
+                assertKeyValue(key, value, done);
             });
         })
     });
@@ -44,10 +48,7 @@ describe('OMCache', function() {
             omc.set(key, 123, 900, function(err, data) {
                 if (err) done(err);
                 omc.increment(key, 22, function(){
-                    omc.get(key, function(err, data) {
-                        assert.equal(data, 123 + 22);
-                        done();
-                    })
+                    assertKeyValue(key, 123 + 22, done);
                 })
             })
         });
@@ -59,14 +60,9 @@ describe('OMCache', function() {
             omc.set(key, 123, 900, function(err, data) {
                 if (err) return done(err);
                 omc.decrement(key, 22, function() {
-                    omc.get(key, function(err, data) {
-                        if (err) return done(err);
-                        assert.equal(data, 123 - 22);
-                        done();
-                    });
+                    assertKeyValue(key, 123 - 22, done);
                 });
             });
         });
     });
-
 });

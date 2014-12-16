@@ -25,7 +25,7 @@ build/binding.Makefile:
 test: $(OMCACHE_BIN)
 	mkdir -p tests/node_modules
 	cp $< tests/node_modules
-	cd tests && npm install mocha && ./node_modules/.bin/mocha
+	cd tests && $(MAKE)
 
 install: $(OMCACHE_BIN)
 	mkdir -p $(BASE)
