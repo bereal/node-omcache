@@ -11,6 +11,9 @@
 #include <list>
 #include <map>
 
+#include <boost/shared_ptr.hpp>
+#include <boost/enable_shared_from_this.hpp>
+
 using namespace v8;
 
 const uint8_t CMD_GET=0x00;
@@ -105,6 +108,9 @@ public:
     // Check if the request is complete and the callback may be destroyed
     inline bool Done() { return m_called; }
     ~Callback();
+
+    typedef boost::shared_ptr<Callback> Ptr;
+
 private:
     // Handle timeout events
     static void Timeout(uv_timer_t * handle, int);
@@ -115,7 +121,7 @@ private:
     size_t m_request_count;
     uv_timer_t m_timer;
     bool m_has_timer;
-    Handle<Function> m_callback;
+    Persistent<Function> m_callback;
     bool m_called;
 };
 
@@ -173,6 +179,7 @@ bool Callback::Ping() {
 
     argv[err ? 0 : 1] = data;
     m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
+    m_callback.Dispose();
 
     scope.Close(Undefined());
     return true;
@@ -190,6 +197,7 @@ void Callback::ProcessTimeout(uv_timer_t * handle) {
 
     Handle<Value> argv[2] = {String::New("operation timeout"), Undefined()};
     m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
+    m_callback.Dispose();
 
     m_has_timer = false;
     uv_timer_stop(&m_timer);
@@ -200,14 +208,18 @@ void Callback::ProcessTimeout(uv_timer_t * handle) {
 /************************************************************
  * Handles socket and timer events
  ************************************************************/
-class Poller {
+
+class Poller: public boost::enable_shared_from_this<Poller> {
 public:
     Poller(omcache_t *omc): m_omc(omc), m_dead(false) {}
-    void Poll(Callback *);
+    void Poll(Callback::Ptr);
     bool Die();
     ~Poller() {
         omcache_free(m_omc);
     }
+
+    typedef boost::shared_ptr<Poller> Ptr;
+
 private:
     // Handle socket events, dispatch to the callbacks
     static void HandleEvent(uv_poll_t *handle, int status, int event);
@@ -222,16 +234,16 @@ private:
 
     struct PollData {
         int fd;
-        Poller * poller;
+        Poller::Ptr poller;
     };
 
     struct IdleData {
         int fd;
         uv_poll_t * poll;
-        Poller * poller;
+        Poller::Ptr poller;
     };
 
-    typedef std::map<int, std::list<Callback *> > PollMap;
+    typedef std::map<int, std::list<Callback::Ptr> > PollMap;
     PollMap m_polls;
 
     uv_idle_t * m_idle;
@@ -239,7 +251,7 @@ private:
     bool m_dead;
 };
 
-void Poller::Poll(Callback *cb) {
+void Poller::Poll(Callback::Ptr cb) {
     uv_loop_t * loop = uv_default_loop();
     int nfds, polltimeout;
     pollfd * fds = omcache_poll_fds(m_omc, &nfds, &polltimeout);
@@ -255,7 +267,7 @@ void Poller::Poll(Callback *cb) {
                 PollData * poll_data = new PollData;
 
                 poll_data->fd = fd;
-                poll_data->poller = this;
+                poll_data->poller = shared_from_this();
 
                 poll_handle->data = poll_data;
                 uv_poll_init(loop, poll_handle, fd);
@@ -279,11 +291,10 @@ void Poller::ProcessEvent(uv_poll_t * handle, int fd, int status, int event) {
     PollMap::mapped_type &callbacks = cb_it->second;
     PollMap::mapped_type::iterator it=callbacks.begin();
     while (it != callbacks.end()) {
-        Callback * cb = *it;
+        Callback::Ptr cb = *it;
 
         if (cb->Ping()) {
             callbacks.erase(it++);
-            delete cb;
         } else {
             ++it;
         }
@@ -292,7 +303,6 @@ void Poller::ProcessEvent(uv_poll_t * handle, int fd, int status, int event) {
     if (callbacks.empty()) {
         StopPolling(handle, fd);
     }
-
 }
 
 void Poller::HandleEvent(uv_poll_t *handle, int status, int event) {
@@ -313,39 +323,42 @@ void Poller::StartIdle(uv_poll_t *poll_handle, int fd) {
     uv_idle_init(uv_default_loop(), handle);
     IdleData * data = new IdleData;
     data->fd = fd;
-    data->poller = this;
+    data->poller = shared_from_this();
     data->poll = poll_handle;
     handle->data = data;
     uv_idle_start(handle, Idle);
 }
 
+void Poller::StopIdle(uv_idle_t *idle) {
+    IdleData * data = static_cast<IdleData*>(idle->data);
+    uv_idle_stop(idle);
+    uv_unref(reinterpret_cast<uv_handle_t *>(idle));
+    delete data;
+}
+
 void Poller::Idle(uv_idle_t *handle, int) {
     IdleData * data = static_cast<IdleData*>(handle->data);
     data->poller->Cleanup(handle, data->poll, data->fd);
-    if (data->poller->m_polls.empty() && data->poller->m_dead) {
-        delete data->poller;
-    }
 }
 
 void Poller::Cleanup(uv_idle_t *idle, uv_poll_t *poll, int fd) {
     if (!m_polls.count(fd)) {
-        uv_idle_stop(idle);
+        StopIdle(idle);
         return;
     }
 
     PollMap::mapped_type &callbacks = m_polls[fd];
     PollMap::mapped_type::iterator it = callbacks.begin();
     while (it != callbacks.end()) {
-        Callback * cb = *it;
+        Callback::Ptr cb = *it;
         if (cb->Done()) {
             callbacks.erase(it++);
-            delete cb;
         } else break;
     }
 
     if (callbacks.empty()) {
-        uv_idle_stop(idle);
-        uv_unref((uv_handle_t*)idle);
+        m_polls.erase(fd);
+        StopIdle(idle);
         StopPolling(poll, fd);
     }
 }
@@ -359,34 +372,31 @@ class OMCache: public node::ObjectWrap {
 public:
     OMCache(const std::string &servers, int timeout): m_timeout(timeout) {
         m_omc = omcache_init();
-        m_poller = new Poller(m_omc);
+        m_poller = Poller::Ptr(new Poller(m_omc));
         omcache_set_servers(m_omc, servers.c_str());
         //        omcache_set_log_callback(m_omc, 100, Log, NULL);
     }
 
-    ~OMCache();
+    //~OMCache();
 
     static void Init(Handle<Object> exports);
-    static OMCache * This(const Arguments &args);
+    static OMCache * This(const Arguments &);
 
-    static Handle<Value> New(const Arguments &args);
-    static Handle<Value> Get(const Arguments &args);
-    static Handle<Value> Set(const Arguments &args);
-    static Handle<Value> Increment(const Arguments &args);
-    static Handle<Value> Decrement(const Arguments &args);
+    static Handle<Value> New(const Arguments &);
+    static Handle<Value> Get(const Arguments &);
+    static Handle<Value> Set(const Arguments &);
+    static Handle<Value> Increment(const Arguments &);
+    static Handle<Value> Decrement(const Arguments &);
+    static Handle<Value> Close(const Arguments &);
 
 private:
     void Send(RequestTemplate &rt, const Local<Value> &callback);
     Handle<Value> Delta(const Arguments &args, int op);
 
-    Poller * m_poller;
+    Poller::Ptr m_poller;
     omcache_t *m_omc;
     int m_timeout;
 };
-
-OMCache::~OMCache() {
-    if (m_poller && m_poller->Die()) delete m_poller;
-}
 
 OMCache * OMCache::This(const Arguments &args) {
     return node::ObjectWrap::Unwrap<OMCache>(args.This());
@@ -405,6 +415,8 @@ void OMCache::Init(Handle<Object> exports) {
                                   FunctionTemplate::New(Increment)->GetFunction());
     tpl->PrototypeTemplate()->Set(String::NewSymbol("decrement"),
                                   FunctionTemplate::New(Decrement)->GetFunction());
+    tpl->PrototypeTemplate()->Set(String::NewSymbol("close"),
+                                  FunctionTemplate::New(Close)->GetFunction());
 
     exports->Set(String::NewSymbol("OMCache"), Persistent<Function>::New(tpl->GetFunction()));
 }
@@ -441,6 +453,7 @@ Handle<Value> OMCache::New(const Arguments& args) {
 
     OMCache * obj = new OMCache(servers, timeout);
     obj->Wrap(args.This());
+    obj->Ref();
     return args.This();
 }
 
@@ -485,8 +498,14 @@ Handle<Value> OMCache::Delta(const Arguments &args, int op) {
     return scope.Close(Undefined());
 }
 
+Handle<Value> OMCache::Close(const Arguments &args) {
+    HandleScope scope;
+    This(args)->Unref();
+    return scope.Close(Undefined());
+}
+
 void OMCache::Send(RequestTemplate &rt, const Local<Value> &callback) {
-    Callback *cb = new Callback(m_omc);
+    Callback::Ptr cb(new Callback(m_omc));
     cb->SendCommand(rt, Persistent<Function>::New(Local<Function>::Cast(callback)), m_timeout);
     m_poller->Poll(cb);
 }

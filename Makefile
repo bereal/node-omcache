@@ -1,6 +1,14 @@
 LIBDIR ?= /usr/lib
 BASE=$(DESTDIR)$(LIBDIR)/node_modules/
+
+ifdef OMCACHE_DEBUG
+OMCACHE_BIN:=./build/Debug/omcache.node
+GYP_OPTS:=-d
+else
 OMCACHE_BIN:=./build/Release/omcache.node
+endif
+
+BOOST_EXCEPTION_DISABLE := yes
 
 PACKAGE_NAME := node-omcache
 VERSION := 0.0.1
@@ -16,11 +24,11 @@ export DEB_DH_INSTALL_ARGS := $(BASE)/omcache.node
 omcache: $(OMCACHE_BIN)
 
 $(OMCACHE_BIN): build/binding.Makefile
-	node-gyp build --verbose
+	node-gyp build --verbose $(GYP_OPTS)
 
 build/binding.Makefile:
 	node-gyp $(NODEGYP_TARGET) --ensure --verbose install
-	node-gyp $(NODEGYP_TARGET) configure
+	node-gyp $(NODEGYP_TARGET) $(GYP_OPTS) configure
 
 test: $(OMCACHE_BIN)
 	mkdir -p tests/node_modules
