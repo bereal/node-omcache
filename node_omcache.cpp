@@ -294,7 +294,7 @@ void Poller::ProcessEvent(uv_poll_t * handle, int fd, int status, int event) {
         Callback::Ptr cb = *it;
 
         if (cb->Ping()) {
-            callbacks.erase(it++);
+            it = callbacks.erase(it);
         } else {
             ++it;
         }
@@ -315,11 +315,14 @@ void Poller::HandleEvent(uv_poll_t *handle, int status, int event) {
 void Poller::StopPolling(uv_poll_t *handle, int fd) {
     uv_poll_stop(handle);
     delete (PollData*)handle->data;
+    uv_unref(reinterpret_cast<uv_handle_t *>(handle));
     m_polls.erase(fd);
+    delete handle;
 }
 
 void Poller::StartIdle(uv_poll_t *poll_handle, int fd) {
     uv_idle_t * handle = new uv_idle_t;
+
     uv_idle_init(uv_default_loop(), handle);
     IdleData * data = new IdleData;
     data->fd = fd;
@@ -352,7 +355,7 @@ void Poller::Cleanup(uv_idle_t *idle, uv_poll_t *poll, int fd) {
     while (it != callbacks.end()) {
         Callback::Ptr cb = *it;
         if (cb->Done()) {
-            callbacks.erase(it++);
+            it = callbacks.erase(it);
         } else break;
     }
 
@@ -376,8 +379,6 @@ public:
         omcache_set_servers(m_omc, servers.c_str());
         //        omcache_set_log_callback(m_omc, 100, Log, NULL);
     }
-
-    //~OMCache();
 
     static void Init(Handle<Object> exports);
     static OMCache * This(const Arguments &);
