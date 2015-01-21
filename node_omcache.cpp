@@ -152,6 +152,7 @@ bool Callback::SendCommand(RequestTemplate &rt, Persistent<Function> callback, i
 
 bool Callback::Ping() {
     if (m_called) return true;
+
     omcache_value_t value;
     memset(&value, 0, sizeof(omcache_value_t));
     size_t value_count = 1;
@@ -179,39 +180,45 @@ bool Callback::Ping() {
 
     argv[err ? 0 : 1] = data;
     m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
-    m_callback.Dispose();
+    m_callback.Clear();
 
-    scope.Close(Undefined());
     return true;
 }
 
 void Callback::Timeout(uv_timer_t *handle, int) {
     Callback * this_ = static_cast<Callback*>(handle->data);
-    if (this_->m_called) return; // actually, should not happen
     this_->ProcessTimeout(handle);
 }
 
 void Callback::ProcessTimeout(uv_timer_t * handle) {
-    HandleScope scope;
-    m_called = true;
+    if (!m_called) {
+        HandleScope scope;
+        m_called = true;
 
-    Handle<Value> argv[2] = {String::New("operation timeout"), Undefined()};
-    m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
-    m_callback.Dispose();
+        Handle<Value> argv[2] = {String::New("operation timeout"), Undefined()};
+        m_callback->Call(Context::GetCurrent()->Global(), 2, argv);
+        m_callback.Clear();
+    }
 
-    m_has_timer = false;
-    uv_timer_stop(&m_timer);
-
-    scope.Close(Undefined());
+    if (m_has_timer) {
+        m_has_timer = false;
+        uv_timer_stop(&m_timer);
+    }
 }
 
 /************************************************************
  * Handles socket and timer events
  ************************************************************/
 
+class RefCount {
+public:
+    virtual void operator++() =0;
+    virtual void operator--() =0;
+};
+
 class Poller: public boost::enable_shared_from_this<Poller> {
 public:
-    Poller(omcache_t *omc): m_omc(omc), m_dead(false) {}
+    Poller(RefCount &rc, omcache_t *omc): m_refcount(rc), m_omc(omc), m_dead(false) {}
     void Poll(Callback::Ptr);
     bool Die();
     ~Poller() {
@@ -246,6 +253,7 @@ private:
     typedef std::map<int, std::list<Callback::Ptr> > PollMap;
     PollMap m_polls;
 
+    RefCount &m_refcount;
     uv_idle_t * m_idle;
     omcache_t *m_omc;
     bool m_dead;
@@ -261,6 +269,7 @@ void Poller::Poll(Callback::Ptr cb) {
             PollMap::mapped_type &dest_list = m_polls[fd];
             bool start_polling = dest_list.empty();
             dest_list.push_back(cb);
+            ++m_refcount;
 
             if (start_polling) {
                 uv_poll_t * poll_handle = new uv_poll_t;
@@ -295,6 +304,7 @@ void Poller::ProcessEvent(uv_poll_t * handle, int fd, int status, int event) {
 
         if (cb->Ping()) {
             it = callbacks.erase(it);
+            --m_refcount;
         } else {
             ++it;
         }
@@ -329,6 +339,7 @@ void Poller::StartIdle(uv_poll_t *poll_handle, int fd) {
     data->poller = shared_from_this();
     data->poll = poll_handle;
     handle->data = data;
+    ++m_refcount;
     uv_idle_start(handle, Idle);
 }
 
@@ -336,6 +347,7 @@ void Poller::StopIdle(uv_idle_t *idle) {
     IdleData * data = static_cast<IdleData*>(idle->data);
     uv_idle_stop(idle);
     uv_unref(reinterpret_cast<uv_handle_t *>(idle));
+    --m_refcount;
     delete data;
 }
 
@@ -356,6 +368,7 @@ void Poller::Cleanup(uv_idle_t *idle, uv_poll_t *poll, int fd) {
         Callback::Ptr cb = *it;
         if (cb->Done()) {
             it = callbacks.erase(it);
+            --m_refcount;
         } else break;
     }
 
@@ -372,10 +385,22 @@ void Poller::Cleanup(uv_idle_t *idle, uv_poll_t *poll, int fd) {
  ************************************************************/
 
 class OMCache: public node::ObjectWrap {
+private:
+    class OMCRefCount: public RefCount {
+    public:
+        OMCRefCount(OMCache *obj): m_obj(obj) {}
+        void operator++ () { m_obj->Ref(); }
+        void operator-- () { m_obj->Unref(); }
+    private:
+        OMCache * m_obj;
+    };
+
+    friend class OMCRefCount;
+
 public:
-    OMCache(const std::string &servers, int timeout): m_timeout(timeout) {
+    OMCache(const std::string &servers, int timeout): m_refcount(this), m_timeout(timeout) {
         m_omc = omcache_init();
-        m_poller = Poller::Ptr(new Poller(m_omc));
+        m_poller = Poller::Ptr(new Poller(m_refcount, m_omc));
         omcache_set_servers(m_omc, servers.c_str());
         //        omcache_set_log_callback(m_omc, 100, Log, NULL);
     }
@@ -394,6 +419,7 @@ private:
     void Send(RequestTemplate &rt, const Local<Value> &callback);
     Handle<Value> Delta(const Arguments &args, int op);
 
+    OMCRefCount m_refcount;
     Poller::Ptr m_poller;
     omcache_t *m_omc;
     int m_timeout;
@@ -454,8 +480,8 @@ Handle<Value> OMCache::New(const Arguments& args) {
 
     OMCache * obj = new OMCache(servers, timeout);
     obj->Wrap(args.This());
-    obj->Ref();
-    return args.This();
+    //obj->Ref();
+    return scope.Close(args.This());
 }
 
 Handle<Value> OMCache::Set(const Arguments &args) {
@@ -464,6 +490,9 @@ Handle<Value> OMCache::Set(const Arguments &args) {
     Local<Value> expiration = args[2];
     if (!expiration.IsEmpty()) {
         extra[1] = htonl(Local<Integer>::Cast(expiration)->Value());
+        /*if (extra[1].IsEmpty()) {
+            return ThrowException(Exception::TypeError(String::New("Invalid type for the argument 2, integer expected")));
+            }*/
     }
 
     RequestTemplate rt(CMD_SET, 0);
@@ -500,9 +529,6 @@ Handle<Value> OMCache::Delta(const Arguments &args, int op) {
 }
 
 Handle<Value> OMCache::Close(const Arguments &args) {
-    HandleScope scope;
-    This(args)->Unref();
-    return scope.Close(Undefined());
 }
 
 void OMCache::Send(RequestTemplate &rt, const Local<Value> &callback) {
